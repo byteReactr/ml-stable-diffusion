@@ -8,7 +8,7 @@ import CoreGraphics
 public enum PipelineMode {
     case textToImage
     case imageToImage
-    // case inPainting
+    case inPainting
 }
 
 /// Image generation configuration
@@ -20,6 +20,12 @@ public struct PipelineConfiguration: Hashable {
     public var negativePrompt: String = ""
     /// Starting image for image2image or in-painting
     public var startingImage: CGImage? = nil
+    /// Inpainting mask. White pixels (1.0) mark the area to be regenerated, black pixels (0.0) are preserved.
+    /// Required when `mode == .inPainting`. Will be bilinearly downsampled to the UNet's latent spatial size.
+    public var mask: CGImage? = nil
+    /// The `startingImage` with the masked region zeroed out (or filled with the latent mean) and re-encoded
+    /// by the VAE. Required when `mode == .inPainting`. Shape produced by the VAE encoder is `[1, 4, H/8, W/8]`.
+    public var maskedImage: CGImage? = nil
     /// Fraction of inference steps to be used in `.imageToImage` pipeline mode
     /// Must be between 0 and 1
     /// Higher values will result in greater transformation of the `startingImage`
@@ -71,6 +77,9 @@ public struct PipelineConfiguration: Hashable {
 
     /// Given the configuration, what mode will be used for generation
     public var mode: PipelineMode {
+        if mask != nil && maskedImage != nil {
+            return .inPainting
+        }
         guard startingImage != nil else {
             return .textToImage
         }
