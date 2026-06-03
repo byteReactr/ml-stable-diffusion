@@ -178,6 +178,48 @@ extension CGImage {
 
             return shapedArray
     }
+
+    /// Downsample a single-channel mask to a target spatial size and return it as
+    /// `MLShapedArray<Float32>` of shape `[1, 1, targetHeight, targetWidth]`.
+    ///
+    /// Used by the inpainting pipeline to feed the `mask` input of a 9-input UNet
+    /// (the SD 1.5 inpainting variant). The luminance of each source pixel is
+    /// averaged by the `CGContext` bilinear interpolation as the source is drawn
+    /// into a grayscale byte buffer at the target size; the result is normalised
+    /// to `0.0…1.0` with no remap. White pixels (1.0) mark the area to
+    /// regenerate, black (0.0) the area to preserve — matching the diffusers
+    /// reference convention.
+    public func planarMaskShapedArray(
+        targetHeight: Int,
+        targetWidth: Int
+    ) throws -> MLShapedArray<Float32> {
+        guard
+            targetWidth > 0, targetHeight > 0,
+            let colorSpace = CGColorSpace(name: CGColorSpace.linearGray),
+            let context = CGContext(
+                data: nil,
+                width: targetWidth,
+                height: targetHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: targetWidth,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ),
+            let ptr = context.data?.bindMemory(to: UInt8.self, capacity: targetWidth * targetHeight)
+        else {
+            throw ShapedArrayError.incorrectFormatsConvertingToShapedArray
+        }
+
+        context.interpolationQuality = .medium
+        context.draw(self, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+
+        var scalars = [Float](repeating: 0, count: targetWidth * targetHeight)
+        for i in 0..<(targetWidth * targetHeight) {
+            scalars[i] = Float(ptr.advanced(by: i).pointee) / 255.0
+        }
+
+        return MLShapedArray<Float32>(scalars: scalars, shape: [1, 1, targetHeight, targetWidth])
+    }
 }
 
 extension vImage_Buffer {

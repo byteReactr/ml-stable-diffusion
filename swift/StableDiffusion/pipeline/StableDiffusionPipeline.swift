@@ -33,6 +33,7 @@ public enum PipelineError: String, Swift.Error {
     case startingText2ImgWithoutTextEncoder
     case unsupportedOSVersion
     case errorCreatingPreview
+    case missingInpaintingInputs
 }
 
 @available(iOS 16.2, macOS 13.1, *)
@@ -258,6 +259,48 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
             )
         }
 
+        // Inpainting pre-loop: VAE-encode the masked image and downsample the mask
+        // to the UNet's latent spatial size. The dict is then passed to every
+        // `unet.predictNoise(...)` call in the denoising loop. Stays empty (and the
+        // feature provider gets no extra keys) for non-inpaint modes.
+        var inpaintingInputs: [String: MLShapedArray<Float32>] = [:]
+        if config.mode == .inPainting {
+            guard
+                let mask = config.mask,
+                let maskedImage = config.maskedImage
+            else {
+                throw PipelineError.missingInpaintingInputs
+            }
+            guard let encoder else {
+                throw PipelineError.startingImageProvidedWithoutEncoder
+            }
+            // Fresh RNG for the masked image VAE encode. Determinism is preserved
+            // per-call via the seed; cross-call coordination with the latent-sample
+            // RNG (inside `generateLatentSamples`) is not required by the
+            // diffusers reference implementation.
+            var inpaintRandom = randomSource(from: config.rngType, seed: config.seed)
+            // VAE-encode the masked image at full resolution. The resulting latent
+            // shape is [1, 4, H/8, W/8] — the UNet will reject the call if H or W
+            // does not match the model's expected input (mirrors `Encoder.encode`'s
+            // existing input-shape guard).
+            let maskedImageLatent = try encoder.encode(
+                maskedImage,
+                scaleFactor: config.encoderScaleFactor,
+                random: &inpaintRandom
+            )
+            // Resize the mask to the latent spatial size, shape [1, 1, H/8, W/8].
+            let latentH = unet.latentSampleShape[2]
+            let latentW = unet.latentSampleShape[3]
+            let maskLatent = try mask.planarMaskShapedArray(
+                targetHeight: latentH,
+                targetWidth: latentW
+            )
+            inpaintingInputs = [
+                "mask": maskLatent,
+                "masked_image": maskedImageLatent
+            ]
+        }
+
         // De-noising loop
         let timeSteps: [Int] = scheduler[0].calculateTimesteps(strength: timestepStrength)
         for (step,t) in timeSteps.enumerated() {
@@ -290,7 +333,8 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                   latents: latentUnetInput,
                   timeStep: t,
                   hiddenStates: hiddenStates,
-                  additionalResiduals: additionalResiduals
+                  additionalResiduals: additionalResiduals,
+                  additionalInputs: inpaintingInputs
                 )
             } else {
                 // Serial predictions from uNet
@@ -300,7 +344,8 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                   latents: latents,
                   timeStep: t,
                   hiddenStates: hidden0,
-                  additionalResiduals: additionalResiduals
+                  additionalResiduals: additionalResiduals,
+                  additionalInputs: inpaintingInputs
                 )
 
                 var hidden1 = MLShapedArray<Float32>(converting: hiddenStates[1])
@@ -309,7 +354,8 @@ public struct StableDiffusionPipeline: StableDiffusionPipelineProtocol {
                   latents: latents,
                   timeStep: t,
                   hiddenStates: hidden1,
-                  additionalResiduals: additionalResiduals
+                  additionalResiduals: additionalResiduals,
+                  additionalInputs: inpaintingInputs
                 )
 
                 noise = [MLShapedArray<Float32>(concatenating: [noise_pred_uncond[0], noise_pred_text[0]],

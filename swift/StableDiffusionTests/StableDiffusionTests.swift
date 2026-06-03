@@ -60,4 +60,82 @@ final class StableDiffusionTests: XCTestCase {
             XCTAssertEqual(value, expected, accuracy: .ulpOfOne.squareRoot())
         }
     }
+
+    /// Smoke test for the inpainting additions on `PipelineConfiguration`:
+    /// the new `mask` and `maskedImage` fields exist, the computed `mode`
+    /// returns `.inPainting` when both are set, the inpainting case is
+    /// mutually exclusive with `.textToImage` and `.imageToImage`, and the
+    /// configuration remains `Hashable` (existing contract preserved).
+    func testInpaintingConfigurationMode() throws {
+        // Use any CGImage as a stand-in for the mask and masked image; the
+        // computed `mode` only inspects pointer presence.
+        let dummyImage = try dummyGrayCGImage(width: 8, height: 8, value: 0xFF)
+
+        var config = PipelineConfiguration(prompt: "a cat in a garden")
+        XCTAssertNil(config.mask)
+        XCTAssertNil(config.maskedImage)
+        XCTAssertEqual(config.mode, .textToImage)
+
+        config.mask = dummyImage
+        XCTAssertEqual(config.mode, .textToImage,
+                       "mask alone is not enough to enter inpainting mode")
+
+        config.maskedImage = dummyImage
+        XCTAssertEqual(config.mode, .inPainting)
+
+        // Drop only one input and the mode must fall back — never inpainting
+        // without both inputs, never image-to-image unless startingImage + strength are set.
+        config.mask = nil
+        XCTAssertEqual(config.mode, .textToImage)
+        config.mask = dummyImage
+
+        // Hashable: equal configs (same prompt, same mask + maskedImage) compare equal.
+        var twin = PipelineConfiguration(prompt: "a cat in a garden")
+        twin.mask = dummyImage
+        twin.maskedImage = dummyImage
+        XCTAssertEqual(config, twin)
+        XCTAssertEqual(config.hashValue, twin.hashValue)
+    }
+
+    /// Smoke test for `CGImage.planarMaskShapedArray`: downsample a 64x64 mask
+    /// of all-ones to a 8x8 latent-sized buffer and confirm the resulting
+    /// array has the expected shape and content.
+    func testPlanarMaskShapedArrayDownsample() throws {
+        let mask = try dummyGrayCGImage(width: 64, height: 64, value: 0xFF)
+        let downsampled = try mask.planarMaskShapedArray(targetHeight: 8, targetWidth: 8)
+        XCTAssertEqual(downsampled.shape, [1, 1, 8, 8])
+        let scalars = downsampled.scalars
+        for v in scalars {
+            XCTAssertEqual(v, 1.0, accuracy: 0.01,
+                           "all-white source mask should produce ~1.0 entries after downsample")
+        }
+    }
+
+    // MARK: - Test helpers
+
+    /// Build a solid-gray CGImage suitable as a stand-in mask or masked image
+    /// in configuration tests. Avoids loading any on-disk resource.
+    private func dummyGrayCGImage(width: Int, height: Int, value: UInt8) throws -> CGImage {
+        let bytesPerRow = width
+        let capacity = width * height
+        var data = [UInt8](repeating: value, count: capacity)
+        let colorSpace = CGColorSpace(name: CGColorSpace.linearGray)!
+        let bitmapInfo = CGImageAlphaInfo.none.rawValue
+        let context = data.withUnsafeMutableBufferPointer { ptr -> CGContext? in
+            CGContext(
+                data: ptr.baseAddress,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: bytesPerRow,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+            )
+        }
+        guard let ctx = context,
+              let image = ctx.makeImage() else {
+            throw NSError(domain: "StableDiffusionTests", code: 1)
+        }
+        return image
+    }
 }

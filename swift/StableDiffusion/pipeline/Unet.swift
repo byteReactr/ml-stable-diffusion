@@ -86,12 +86,19 @@ public struct Unet: ResourceManaging {
     ///   - latents: Batch of latent samples in an array
     ///   - timeStep: Current diffusion timestep
     ///   - hiddenStates: Hidden state to condition on
+    ///   - additionalResiduals: Optional per-batch residual inputs from ControlNet
+    ///   - additionalInputs: Optional per-model extra inputs applied identically to
+    ///     every batch element. Used by the inpainting pipeline to pass `mask`
+    ///     (Float32 `[1, 1, H, W]`) and `masked_image` (Float32 `[1, 4, H, W]`).
+    ///     When `nil` or empty (the default for text-to-image and image-to-image)
+    ///     the behaviour is identical to upstream.
     /// - Returns: Array of predicted noise residuals
     func predictNoise(
         latents: [MLShapedArray<Float32>],
         timeStep: Int,
         hiddenStates: MLShapedArray<Float32>,
-        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil
+        additionalResiduals: [[String: MLShapedArray<Float32>]]? = nil,
+        additionalInputs: [String: MLShapedArray<Float32>]? = nil
     ) throws -> [MLShapedArray<Float32>] {
 
         // Match time step batch dimension to the model / latent samples
@@ -111,6 +118,11 @@ public struct Unet: ResourceManaging {
             ]
             if let residuals = additionalResiduals?[$0.offset] {
                 for (k, v) in residuals {
+                    dict[k] = MLMultiArray(v)
+                }
+            }
+            if let additionalInputs, !additionalInputs.isEmpty {
+                for (k, v) in additionalInputs {
                     dict[k] = MLMultiArray(v)
                 }
             }
