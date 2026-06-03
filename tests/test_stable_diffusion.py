@@ -408,3 +408,46 @@ if __name__ == "__main__":
         else:
             runner = unittest.TextTestRunner()
             runner.run(suite)
+
+
+class TestInpaintingUnetConversionSupport(unittest.TestCase):
+    """Smoke tests for the inpainting UNet conversion path added by
+    thrtysxty/ml-stable-diffusion. These tests do not require a GPU or a
+    real model checkpoint — they only verify that the CLI accepts the new
+    flag and that the conversion function exists with the right signature.
+    """
+
+    def test_arg_parser_accepts_convert_inpainting_unet(self):
+        """--convert-inpainting-unet must be accepted by the CLI parser.
+        """
+        from python_coreml_stable_diffusion import torch2coreml
+        parser = torch2coreml.parser_spec()
+        ns = parser.parse_args([
+            "--model-version", "runwayml/stable-diffusion-inpainting",
+            "--convert-inpainting-unet",
+        ])
+        self.assertTrue(ns.convert_inpainting_unet)
+        self.assertFalse(ns.convert_unet)
+
+    def test_arg_parser_accepts_inpainting_nbits(self):
+        """--inpainting-nbits must be accepted and constrained to valid choices.
+        """
+        from python_coreml_stable_diffusion import torch2coreml
+        parser = torch2coreml.parser_spec()
+        ns = parser.parse_args([
+            "--model-version", "runwayml/stable-diffusion-inpainting",
+            "--convert-inpainting-unet",
+            "--inpainting-nbits", "8",
+        ])
+        self.assertEqual(ns.inpainting_nbits, 8)
+
+    def test_convert_inpainting_unet_function_exists(self):
+        """convert_inpainting_unet must exist and have signature (pipe, args).
+        """
+        import inspect
+        from python_coreml_stable_diffusion import torch2coreml
+        self.assertTrue(hasattr(torch2coreml, "convert_inpainting_unet"))
+        self.assertTrue(callable(torch2coreml.convert_inpainting_unet))
+        sig = inspect.signature(torch2coreml.convert_inpainting_unet)
+        self.assertEqual(list(sig.parameters.keys()), ["pipe", "args"])
+
