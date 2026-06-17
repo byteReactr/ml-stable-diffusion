@@ -1050,6 +1050,233 @@ def convert_unet(pipe, args, model_name=None):
         chunk_mlprogram.main(args)
 
 
+def convert_inpainting_unet(pipe, args):
+    """ Converts the inpainting UNet component of Stable Diffusion.
+
+    The inpainting UNet is identical in topology to the standard UNet
+    (UNet2DConditionModel) but its first conv layer (`conv_in`) has
+    `in_channels = 9` instead of 4. The extra 5 channels are the downsampled
+    mask (1 channel) and the VAE-encoded masked image (4 channels), which
+    are concatenated to the noisy latents before being fed to the network.
+
+    See: https://huggingface.co/docs/diffusers/api/models/unet2d-cond#diffusers.UNet2DConditionModel.forward
+    and: https://github.com/runwayml/stable-diffusion#inpainting
+    """
+    if args.convert_unet:
+        raise RuntimeError(
+            "--convert-unet and --convert-inpainting-unet are mutually "
+            "exclusive. Pick one."
+        )
+    if args.unet_support_controlnet:
+        raise RuntimeError(
+            "--unet-support-controlnet is not compatible with "
+            "--convert-inpainting-unet. The inpainting UNet does not accept "
+            "controlnet residuals; it only accepts the standard inputs plus "
+            "the 9-channel concatenated sample."
+        )
+
+    in_channels = pipe.unet.config.in_channels
+    if in_channels != 9:
+        raise RuntimeError(
+            f"`--convert-inpainting-unet` requires a 9-channel UNet, but "
+            f"`{args.model_version}` reports in_channels={in_channels}. "
+            f"Use an inpainting checkpoint such as "
+            f"`runwayml/stable-diffusion-inpainting` or "
+            f"`stabilityai/stable-diffusion-2-inpainting`."
+        )
+
+    unet_name = "unet"
+    out_path = _get_out_path(args, unet_name)
+    if os.path.exists(out_path):
+        logger.info(
+            f"`unet` already exists at {out_path}, skipping conversion.")
+        del pipe.unet
+        gc.collect()
+        return
+
+    # Prepare sample input shapes and values. The inpainting UNet expects
+    # the 9-channel `sample` to be the concatenation of:
+    #   noisy_latents            (4 channels)
+    #   mask (downsampled 1ch)   (1 channel)
+    #   masked_image (latents)   (4 channels)
+    # The mask and masked_image must be supplied at the latent resolution
+    # (H/8, W/8). Callers (Swift pipeline, Python pipeline) are responsible
+    # for VAE-encoding the masked region and downsampling the binary mask.
+    batch_size = 2  # for classifier-free guidance
+    if args.unet_batch_one:
+        batch_size = 1
+
+    sample_h = args.latent_h or pipe.unet.config.sample_size
+    sample_w = args.latent_w or pipe.unet.config.sample_size
+
+    sample_shape = (
+        batch_size,  # B
+        in_channels,  # C = 9
+        sample_h,
+        sample_w,
+    )
+
+    if not hasattr(pipe, "text_encoder"):
+        raise RuntimeError(
+            "convert_inpainting_unet() requires pipe.text_encoder to be "
+            "present. Please call convert_text_encoder() after "
+            "convert_inpainting_unet(), not before."
+        )
+    if pipe.text_encoder is not None:
+        text_token_sequence_length = pipe.text_encoder.config.max_position_embeddings
+        hidden_size = pipe.text_encoder.config.hidden_size
+    elif hasattr(pipe, "text_encoder_2") and pipe.text_encoder_2 is not None:
+        text_token_sequence_length = pipe.text_encoder_2.config.max_position_embeddings
+        hidden_size = pipe.text_encoder_2.config.hidden_size
+    else:
+        raise RuntimeError(
+            "Could not find a text encoder on the pipeline to derive "
+            "encoder_hidden_states shape."
+        )
+
+    encoder_hidden_states_shape = (
+        batch_size,
+        args.text_encoder_hidden_size
+        or pipe.unet.config.cross_attention_dim
+        or hidden_size,
+        1,
+        args.text_token_sequence_length or text_token_sequence_length,
+    )
+
+    # Create the scheduled timesteps for downstream use
+    DEFAULT_NUM_INFERENCE_STEPS = 50
+    pipe.scheduler.set_timesteps(DEFAULT_NUM_INFERENCE_STEPS)
+
+    # 9-channel sample: [noisy_latents (4) | mask (1) | masked_image_latents (4)]
+    noisy_latents = torch.rand(batch_size, 4, sample_h, sample_w)
+    mask = torch.rand(batch_size, 1, sample_h, sample_w)
+    masked_image_latents = torch.rand(batch_size, 4, sample_h, sample_w)
+    sample_9ch = torch.cat([noisy_latents, mask, masked_image_latents], dim=1)
+
+    sample_unet_inputs = OrderedDict([
+        ("sample", sample_9ch),
+        ("timestep",
+         torch.tensor([pipe.scheduler.timesteps[0].item()] *
+                      (batch_size)).to(torch.float32)),
+        ("encoder_hidden_states", torch.rand(*encoder_hidden_states_shape)),
+    ])
+
+    # Build baseline inputs for the parity check: the diffusers reference
+    # UNet takes the same 9-channel concatenation, so the baseline dict is
+    # identical to the traced dict modulo the encoder_hidden_states layout
+    # (the Apple reference expects 4D BHWC-style for cross-attention).
+    baseline_sample_unet_inputs = deepcopy(sample_unet_inputs)
+    baseline_sample_unet_inputs[
+        "encoder_hidden_states"] = baseline_sample_unet_inputs[
+            "encoder_hidden_states"].squeeze(2).transpose(1, 2)
+
+    # Initialize reference unet using the in_channels from the loaded
+    # checkpoint (which is 9 for inpainting, 4 otherwise). The Apple
+    # UNet2DConditionModel reads in_channels from **pipe.unet.config, so
+    # the 9-channel first conv is reproduced automatically.
+    unet_cls = unet.UNet2DConditionModel
+    reference_unet = unet_cls(**pipe.unet.config).eval()
+    load_state_dict_summary = reference_unet.load_state_dict(
+        pipe.unet.state_dict())
+    logger.info(
+        f"Inpainting UNet conv_in.in_channels = "
+        f"{reference_unet.conv_in.in_channels} (expected 9)")
+
+    sample_unet_inputs_spec = {
+        k: (v.shape, v.dtype)
+        for k, v in sample_unet_inputs.items()
+    }
+    logger.info(f"Sample inpainting UNet inputs spec: {sample_unet_inputs_spec}")
+
+    # JIT trace
+    logger.info("JIT tracing inpainting UNet..")
+    reference_unet = torch.jit.trace(reference_unet,
+                                     list(sample_unet_inputs.values()))
+    logger.info("Done.")
+
+    if args.check_output_correctness:
+        baseline_out = pipe.unet.to(torch.float32)(
+            **baseline_sample_unet_inputs, return_dict=False)[0].numpy()
+        reference_out = reference_unet(*sample_unet_inputs.values())[0].numpy()
+        report_correctness(baseline_out, reference_out,
+                           "inpainting_unet baseline to reference PyTorch")
+
+    del pipe.unet
+    gc.collect()
+
+    coreml_sample_unet_inputs = {
+        k: v.numpy().astype(np.float16)
+        for k, v in sample_unet_inputs.items()
+    }
+
+    coreml_unet, out_path = _convert_to_coreml(unet_name, reference_unet,
+                                               coreml_sample_unet_inputs,
+                                               ["noise_pred"], args)
+    del reference_unet
+    gc.collect()
+
+    # Set model metadata
+    coreml_unet.author = f"Please refer to the Model Card available at huggingface.co/{args.model_version}"
+    coreml_unet.license = \
+        "OpenRAIL (https://huggingface.co/spaces/CompVis/stable-diffusion-license)"
+    coreml_unet.version = args.model_version
+    coreml_unet.short_description = \
+        "Stable Diffusion inpainting UNet. Generates images conditioned on " \
+        "text, a binary mask, and a masked image region. The first conv " \
+        "layer expects a 9-channel tensor (4 noisy latents + 1 mask + 4 " \
+        "masked image latents). " \
+        "Please refer to https://arxiv.org/abs/2112.10752 for details."
+
+    # Set the input descriptions
+    coreml_unet.input_description["sample"] = \
+        "9-channel tensor at latent resolution: [noisy_latents (4) | " \
+        "downsampled mask (1) | masked_image VAE latents (4)]"
+    coreml_unet.input_description["timestep"] = \
+        "A value emitted by the associated scheduler object to condition " \
+        "the model on a given noise schedule"
+    coreml_unet.input_description["encoder_hidden_states"] = \
+        "Output embeddings from the associated text_encoder model to " \
+        "condition the generated image on text. A maximum of 77 tokens " \
+        "(~40 words) are allowed. Longer text is truncated. " \
+        "Shorter text does not reduce computation."
+
+    # Set the output descriptions
+    coreml_unet.output_description["noise_pred"] = \
+        "Same shape as the first 4 channels of the `sample` input " \
+        "([B, 4, H, W]). The predicted noise to facilitate the reverse " \
+        "diffusion (denoising) process."
+
+    # Set package version metadata
+    from python_coreml_stable_diffusion._version import __version__
+    coreml_unet.user_defined_metadata["com.github.apple.ml-stable-diffusion.version"] = __version__
+    coreml_unet.user_defined_metadata[
+        "com.github.thrtysxty.ml-stable-diffusion.fork"
+    ] = "inpainting-unet-support"
+
+    coreml_unet.save(out_path)
+    logger.info(f"Saved inpainting unet into {out_path}")
+
+    # Parity check PyTorch vs CoreML
+    if args.check_output_correctness:
+        coreml_out = list(
+            coreml_unet.predict(coreml_sample_unet_inputs).values())[0]
+        report_correctness(baseline_out, coreml_out,
+                           "inpainting_unet baseline PyTorch to reference CoreML")
+
+    del coreml_unet
+    gc.collect()
+
+    # Apply palettization if requested. The inpainting UNet is more
+    # sensitive to quantization than the 3 smaller submodels because it
+    # runs at every diffusion step, so we default to 8-bit unless the
+    # caller overrides with --inpainting-nbits.
+    if args.inpainting_nbits is not None:
+        logger.info(
+            f"Quantizing inpainting unet to {args.inpainting_nbits}-bit precision"
+        )
+        _quantize_weights(out_path, "inpainting_unet", args.inpainting_nbits)
+
+
 def convert_mmdit(args):
     """ Converts the MMDiT component of Stable Diffusion 3
     """
@@ -1554,6 +1781,11 @@ def main(args):
         convert_unet(pipe, args)
         logger.info("Converted unet")
 
+    if args.convert_inpainting_unet:
+        logger.info("Converting inpainting_unet")
+        convert_inpainting_unet(pipe, args)
+        logger.info("Converted inpainting_unet")
+
     if args.convert_text_encoder and hasattr(pipe, "text_encoder") and pipe.text_encoder is not None:
         logger.info("Converting text_encoder")
         convert_text_encoder(pipe.text_encoder, pipe.tokenizer, "text_encoder", args)
@@ -1608,6 +1840,28 @@ def parser_spec():
     parser.add_argument("--convert-vae-decoder", action="store_true")
     parser.add_argument("--convert-vae-encoder", action="store_true")
     parser.add_argument("--convert-unet", action="store_true")
+    parser.add_argument(
+        "--convert-inpainting-unet",
+        action="store_true",
+        help=
+        "Convert the inpainting UNet (e.g. runwayml/stable-diffusion-inpainting). "
+        "The inpainting UNet expects 9-channel input "
+        "(4 noisy latents + 1 downsampled mask + 4 masked_image_latent) "
+        "concatenated along the channel dimension, plus the standard "
+        "`timestep` and `encoder_hidden_states` inputs. "
+        "Mutually exclusive with --convert-unet."
+    )
+    parser.add_argument(
+        "--inpainting-nbits",
+        default=None,
+        choices=(1, 2, 4, 6, 8),
+        type=int,
+        help=
+        "If specified together with --convert-inpainting-unet, quantizes the "
+        "inpainting UNet to this many bits (kmeans palettization). "
+        "Defaults to 8 for the UNet (better quality for LCM / low-step schedulers); "
+        "use 6 for the standard 20+ step DDIM schedulers."
+    )
     parser.add_argument("--convert-mmdit", action="store_true")
     parser.add_argument("--convert-safety-checker", action="store_true")
     parser.add_argument(

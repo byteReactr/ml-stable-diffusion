@@ -563,6 +563,23 @@ This generally takes 15-20 minutes on an M1 MacBook Pro. Upon successful executi
 
 - `--convert-vae-encoder`: not required for text-to-image applications. Required for image-to-image applications in order to map the input image to the latent space.
 
+#### Inpainting Models
+
+The `--convert-inpainting-unet` flag converts the 9-channel inpainting UNet for use with inpainting pipelines (e.g. `runwayml/stable-diffusion-1-5-inpainting`, `stabilityai/stable-diffusion-2-inpainting`). The inpainting UNet's first convolution expects a 9-channel input concatenated as `[noisy_latents (4) | downsampled mask (1) | masked_image VAE latents (4)]`. The mask and masked image are supplied at latent resolution (`H/8`, `W/8`); callers are responsible for VAE-encoding the masked region and downsampling the binary mask.
+
+```shell
+python -m python_coreml_stable_diffusion.torch2coreml \
+  --convert-inpainting-unet --inpainting-nbits 8 \
+  --convert-text-encoder --convert-vae-encoder --convert-vae-decoder \
+  --model-version runwayml/stable-diffusion-1-5-inpainting \
+  -o <output-mlpackages-directory>
+```
+
+Notes:
+- `--convert-inpainting-unet` is **mutually exclusive** with `--convert-unet` and `--unet-support-controlnet`. The inpainting UNet only accepts the standard inputs plus the 9-channel concatenated sample.
+- `--inpainting-nbits {1,2,4,6,8}` controls kmeans palettization of the inpainting UNet. The default is `8` because the inpainting UNet is more sensitive to quantization than the 3 smaller submodels (it runs at every diffusion step). Use `6` if you are running 20+ step schedulers and need to fit a tight iOS budget.
+- The toolchain validates that the loaded checkpoint reports `in_channels == 9`; non-inpainting checkpoints will fail with a clear error message.
+
 </details>
 
 ## <a name="image-generation-with-python"></a> Image Generation with Python
